@@ -1,11 +1,16 @@
 import base64
 import os
+import time
 from dataclasses import dataclass, field
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
-MODEL_NAME = "gemini-3.6-flash"
+from tracing import tracer
+
+MODEL_NAME = "gemini-3.5-flash-lite"
+MAX_ATTEMPTS = 5
+BASE_BACKOFF_SECONDS = 5
 
 TOOL_DECLARATIONS = [
     types.FunctionDeclaration(
@@ -148,6 +153,24 @@ def _to_gemini_contents(messages):
     return contents
 
 
+def _generate_with_retry(client, contents, config):
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(model=MODEL_NAME, contents=contents, config=config)
+            return response, attempt - 1
+        except errors.ClientError as exc:
+            if exc.code != 429 or attempt == MAX_ATTEMPTS:
+                raise
+            last_error = exc
+        except errors.ServerError as exc:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            last_error = exc
+        time.sleep(BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    raise last_error
+
+
 def call_model(system_prompt, messages, tool_declarations=TOOL_DECLARATIONS):
     client = _client()
     contents = _to_gemini_contents(messages)
@@ -155,7 +178,23 @@ def call_model(system_prompt, messages, tool_declarations=TOOL_DECLARATIONS):
         system_instruction=system_prompt,
         tools=[types.Tool(function_declarations=tool_declarations)],
     )
-    response = client.models.generate_content(model=MODEL_NAME, contents=contents, config=config)
+
+    with tracer.start_as_current_span("call_model") as span:
+        start = time.perf_counter()
+        response, retry_count = _generate_with_retry(client, contents, config)
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        usage = response.usage_metadata
+        token_count_in = usage.prompt_token_count if usage else None
+        token_count_out = usage.candidates_token_count if usage else None
+
+        span.set_attribute("model.name", MODEL_NAME)
+        span.set_attribute("latency_ms", latency_ms)
+        span.set_attribute("retry_count", retry_count)
+        if token_count_in is not None:
+            span.set_attribute("token_count_in", token_count_in)
+        if token_count_out is not None:
+            span.set_attribute("token_count_out", token_count_out)
 
     candidate = response.candidates[0]
     text_parts = []

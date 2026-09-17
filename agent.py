@@ -6,7 +6,9 @@ from dotenv import load_dotenv
 
 import tools
 from model import call_model
-from policy import Decision, policy_check
+from policy import Decision
+from policy import policy_check as default_policy_check
+from tracing import tracer
 
 load_dotenv()
 
@@ -87,55 +89,67 @@ def _execute(name, args):
         return str(e)
 
 
-def _loop(issue_number, run_id, messages, steps, max_steps):
+def _loop(issue_number, run_id, messages, steps, max_steps, policy_check_fn):
     while steps < max_steps:
-        response = call_model(SYSTEM_PROMPT, messages)
+        with tracer.start_as_current_span("agent_step") as step_span:
+            step_span.set_attribute("issue_number", issue_number)
+            step_span.set_attribute("run_id", run_id)
+            step_span.set_attribute("step_number", steps)
 
-        if not response.tool_calls:
-            messages.append({"role": "assistant", "content": response.text})
-            _persist_run_state(issue_number, run_id, messages, steps, status="completed")
-            print(f"[run {run_id}] issue #{issue_number}: completed normally after {steps} step(s)")
-            return {"status": "completed", "issue_number": issue_number, "run_id": run_id, "messages": messages}
+            response = call_model(SYSTEM_PROMPT, messages)
 
-        messages.append(
-            {
-                "role": "assistant",
-                "content": response.text,
-                "tool_calls": [
-                    {"id": c.id, "name": c.name, "args": c.args, "thought_signature": c.thought_signature}
-                    for c in response.tool_calls
-                ],
-            }
-        )
+            if not response.tool_calls:
+                step_span.set_attribute("outcome", "completed")
+                messages.append({"role": "assistant", "content": response.text})
+                _persist_run_state(issue_number, run_id, messages, steps, status="completed")
+                print(f"[run {run_id}] issue #{issue_number}: completed normally after {steps} step(s)")
+                return {"status": "completed", "issue_number": issue_number, "run_id": run_id, "messages": messages}
 
-        for call in response.tool_calls:
-            decision, reason = policy_check(call.name, call.args)
+            step_span.set_attribute("tool.names", [c.name for c in response.tool_calls])
 
-            if decision == Decision.DENY:
-                result_text = f"Not permitted: {reason or 'this action is denied by policy'}"
-                messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result_text})
-                continue
-
-            if decision == Decision.APPROVE:
-                pending_tool_call = {"id": call.id, "name": call.name, "args": call.args, "reason": reason}
-                _persist_run_state(
-                    issue_number,
-                    run_id,
-                    messages,
-                    steps,
-                    status="awaiting_approval",
-                    pending_tool_call=pending_tool_call,
-                )
-                print(f"[run {run_id}] issue #{issue_number}: paused for human approval on {call.name} ({reason})")
-                return {
-                    "status": "awaiting_approval",
-                    "issue_number": issue_number,
-                    "run_id": run_id,
-                    "pending_tool_call": pending_tool_call,
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.text,
+                    "tool_calls": [
+                        {"id": c.id, "name": c.name, "args": c.args, "thought_signature": c.thought_signature}
+                        for c in response.tool_calls
+                    ],
                 }
+            )
 
-            result_text = _execute(call.name, call.args)
-            messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result_text})
+            for call in response.tool_calls:
+                decision, reason = policy_check_fn(call.name, call.args)
+                step_span.set_attribute(f"policy_decision.{call.name}", decision)
+
+                if decision == Decision.DENY:
+                    result_text = f"Not permitted: {reason or 'this action is denied by policy'}"
+                    messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result_text})
+                    continue
+
+                if decision == Decision.APPROVE:
+                    step_span.set_attribute("outcome", "awaiting_approval")
+                    pending_tool_call = {"id": call.id, "name": call.name, "args": call.args, "reason": reason}
+                    _persist_run_state(
+                        issue_number,
+                        run_id,
+                        messages,
+                        steps,
+                        status="awaiting_approval",
+                        pending_tool_call=pending_tool_call,
+                    )
+                    print(f"[run {run_id}] issue #{issue_number}: paused for human approval on {call.name} ({reason})")
+                    return {
+                        "status": "awaiting_approval",
+                        "issue_number": issue_number,
+                        "run_id": run_id,
+                        "pending_tool_call": pending_tool_call,
+                    }
+
+                result_text = _execute(call.name, call.args)
+                messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result_text})
+
+            step_span.set_attribute("outcome", "step_complete")
 
         steps += 1
 
@@ -144,14 +158,14 @@ def _loop(issue_number, run_id, messages, steps, max_steps):
     return {"status": "step_cap_hit", "issue_number": issue_number, "run_id": run_id, "messages": messages}
 
 
-def run_agent(issue_number, max_steps=MAX_STEPS, run_id=None):
+def run_agent(issue_number, max_steps=MAX_STEPS, run_id=None, policy_check_fn=default_policy_check):
     run_id = run_id or uuid.uuid4().hex[:8]
     issue = tools.get_issue(issue_number)
     messages = [{"role": "user", "content": _format_issue_context(issue)}]
-    return _loop(issue_number, run_id, messages, steps=0, max_steps=max_steps)
+    return _loop(issue_number, run_id, messages, steps=0, max_steps=max_steps, policy_check_fn=policy_check_fn)
 
 
-def resume_agent(issue_number, run_id, approved, max_steps=MAX_STEPS):
+def resume_agent(issue_number, run_id, approved, max_steps=MAX_STEPS, policy_check_fn=default_policy_check):
     state = _load_run_state(issue_number, run_id)
     if state["status"] != "awaiting_approval":
         raise ValueError(f"Run {run_id} for issue #{issue_number} is not awaiting approval (status={state['status']})")
@@ -165,4 +179,4 @@ def resume_agent(issue_number, run_id, approved, max_steps=MAX_STEPS):
         result_text = "Not permitted: human reviewer declined this action"
 
     messages.append({"role": "tool", "tool_call_id": pending["id"], "name": pending["name"], "content": result_text})
-    return _loop(issue_number, run_id, messages, steps=state["steps"], max_steps=max_steps)
+    return _loop(issue_number, run_id, messages, steps=state["steps"], max_steps=max_steps, policy_check_fn=policy_check_fn)

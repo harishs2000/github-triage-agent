@@ -4,8 +4,10 @@ from functools import lru_cache
 
 from github import Auth, Github, GithubException, RateLimitExceededException, UnknownObjectException
 from github.IssueComment import IssueComment
+from opentelemetry.trace import Status, StatusCode
 
 from config import REPO_FULL_NAME
+from tracing import tracer
 
 MAX_ATTEMPTS = 4
 BASE_BACKOFF_SECONDS = 2
@@ -47,9 +49,26 @@ def _is_rate_limit(exc):
 
 
 def _call(operation_name, func):
+    with tracer.start_as_current_span("tool_call") as span:
+        span.set_attribute("tool.name", operation_name)
+        start = time.perf_counter()
+        try:
+            result = _call_with_retries(operation_name, func, span)
+            span.set_attribute("tool.success", True)
+            return result
+        except ToolError as exc:
+            span.set_attribute("tool.success", False)
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
+            raise
+        finally:
+            span.set_attribute("latency_ms", (time.perf_counter() - start) * 1000)
+
+
+def _call_with_retries(operation_name, func, span):
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
+            span.set_attribute("retry_count", attempt - 1)
             return func()
         except UnknownObjectException as exc:
             raise ToolError(f"{operation_name} failed: not found (404)") from exc
@@ -85,6 +104,26 @@ def _issue_to_dict(issue):
     }
 
 
+def create_issue(title, body):
+    """Eval/seed infrastructure only -- not exposed to the agent as a tool."""
+
+    def op():
+        repo = _get_repo()
+        return _issue_to_dict(repo.create_issue(title=title, body=body))
+
+    return _call("create_issue", op)
+
+
+def get_comments(issue_number):
+    """Eval/seed infrastructure only -- not exposed to the agent as a tool."""
+
+    def op():
+        repo = _get_repo()
+        return [c.body for c in repo.get_issue(issue_number).get_comments()]
+
+    return _call("get_comments", op)
+
+
 def list_issues(state="open"):
     def op():
         repo = _get_repo()
@@ -106,8 +145,11 @@ def get_issue(issue_number):
 
 
 def search_issues(query):
+    """Searches open issues only -- duplicate-checking cares about issues
+    still active, not ones already closed and resolved long ago."""
+
     def op():
-        full_query = f"repo:{REPO_FULL_NAME} is:issue {query}"
+        full_query = f"repo:{REPO_FULL_NAME} is:issue is:open {query}"
         return [_issue_to_dict(issue) for issue in _get_client().search_issues(full_query)]
 
     return _call("search_issues", op)

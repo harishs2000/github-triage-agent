@@ -16,3 +16,6 @@ venv/
 
 # Agent run state
 runs/
+
+# Eval scenario-to-issue mapping (ephemeral, issue numbers change every reseed)
+eval_state.json
