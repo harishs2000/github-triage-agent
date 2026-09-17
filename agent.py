@@ -117,20 +117,21 @@ def _loop(issue_number, run_id, messages, steps, max_steps):
                 continue
 
             if decision == Decision.APPROVE:
+                pending_tool_call = {"id": call.id, "name": call.name, "args": call.args, "reason": reason}
                 _persist_run_state(
                     issue_number,
                     run_id,
                     messages,
                     steps,
                     status="awaiting_approval",
-                    pending_tool_call={"id": call.id, "name": call.name, "args": call.args},
+                    pending_tool_call=pending_tool_call,
                 )
-                print(f"[run {run_id}] issue #{issue_number}: paused for human approval on {call.name}")
+                print(f"[run {run_id}] issue #{issue_number}: paused for human approval on {call.name} ({reason})")
                 return {
                     "status": "awaiting_approval",
                     "issue_number": issue_number,
                     "run_id": run_id,
-                    "pending_tool_call": {"name": call.name, "args": call.args},
+                    "pending_tool_call": pending_tool_call,
                 }
 
             result_text = _execute(call.name, call.args)
