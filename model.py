@@ -3,6 +3,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+import httpx
 from google import genai
 from google.genai import errors, types
 
@@ -11,6 +12,7 @@ from tracing import tracer
 MODEL_NAME = "gemini-3.5-flash-lite"
 MAX_ATTEMPTS = 5
 BASE_BACKOFF_SECONDS = 5
+REQUEST_TIMEOUT_MS = 60_000
 
 TOOL_DECLARATIONS = [
     types.FunctionDeclaration(
@@ -114,7 +116,14 @@ class ModelResponse:
 
 
 def _client():
-    return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    # Without an explicit timeout a stalled connection blocks forever: the
+    # retry loop below only fires on errors, and a call that never returns
+    # never raises one. Observed model calls run 0.6-2.5s, so 60s is far
+    # above normal while still failing fast on a hang.
+    return genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"],
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+    )
 
 
 def _to_gemini_contents(messages):
@@ -164,6 +173,10 @@ def _generate_with_retry(client, contents, config):
                 raise
             last_error = exc
         except errors.ServerError as exc:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            last_error = exc
+        except httpx.TimeoutException as exc:
             if attempt == MAX_ATTEMPTS:
                 raise
             last_error = exc

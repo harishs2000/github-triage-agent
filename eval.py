@@ -181,7 +181,9 @@ if __name__ == "__main__":
 
     summary = summarize(results, args.condition)
 
-    out_path = Path(f"eval_results_{args.condition}.json")
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    out_path = results_dir / f"eval_results_{args.condition}.json"
     out_path.write_text(json.dumps({"condition": args.condition, "results": results, "summary": summary}, indent=2))
     print(f"\nSaved results to {out_path}")
 

@@ -1,5 +1,4 @@
 import re
-from functools import lru_cache
 
 import tools
 
@@ -33,8 +32,14 @@ def _looks_like_injection(text):
     return any(pattern.search(text or "") for pattern in INJECTION_PATTERNS)
 
 
-@lru_cache(maxsize=256)
 def _is_issue_escalated(issue_number):
+    """Deliberately uncached: the issue body is re-fetched on every check.
+
+    A cache keyed by issue number would let someone file a benign issue,
+    wait for the clean result to be cached, then edit the body to add
+    injection text -- the stale "not escalated" verdict would stand. The
+    extra API call is cheap next to that.
+    """
     issue = tools.get_issue(issue_number)
     return _looks_like_injection(issue["title"]) or _looks_like_injection(issue["body"])
 
